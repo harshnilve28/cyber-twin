@@ -1,327 +1,88 @@
-"""
-Main FastAPI application.
-This is the entry point for the Cyber-Twins microservice.
-"""
-
+# app/main.py
+from fastapi import FastAPI, Request, HTTPException, Response
+from pydantic import BaseModel
 import time
-from datetime import datetime
-from typing import Optional
-from fastapi import FastAPI, Request, HTTPException, Depends, status
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from prometheus_fastapi_instrumentator import Instrumentator
-import structlog
+import uvicorn
 
-from app.config import settings
-from app.models import (
-    LoginRequest, LoginResponse, HealthResponse, 
-    MetricsResponse, ThreatEvent
-)
-from app.security import security_manager
-from app.metrics import (
-    http_requests_total, http_request_duration_seconds,
-    failed_logins_total, successful_logins_total,
-    blocked_ips_current, active_threats,
-    threats_detected_total, remediation_actions_total,
-    get_uptime_seconds
-)
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
-# Configure structured logging
-logger = structlog.get_logger()
+app = FastAPI(title="Cyber-Twins - Self Healing")
 
-# Create FastAPI app
-app = FastAPI(
-    title=settings.app_name,
-    version=settings.app_version,
-    description="Self-Healing Cloud Infrastructure with Digital Twin Cyber Defense"
-)
+# --- Prometheus metrics ---
+HTTP_REQ_TOTAL = Counter("http_requests_total", "Total HTTP requests", ["method", "endpoint", "status"])
+HTTP_REQ_LATENCY = Histogram("http_request_duration_seconds", "Request latency seconds", ["endpoint"])
+FAILED_LOGINS = Counter("failed_logins_total", "Failed authentication attempts")
+SUSPICIOUS_IPS = Counter("suspicious_ips_total", "Suspicious IPs detected")
+REMEDIATIONS = Counter("remediation_actions_total", "Auto-remediation actions taken")
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # In production, specify allowed origins
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# --- simple in-memory stores (for dev) ---
+FAILED_ATTEMPTS = {}   # {ip: [timestamps]}
+BLOCKED_IPS = {}      # {ip: unblock_epoch}
 
-# Setup Prometheus instrumentation
-if settings.prometheus_enabled:
-    instrumentator = Instrumentator()
-    instrumentator.instrument(app).expose(app, endpoint=settings.metrics_path)
+LOGIN_THRESHOLD = 5               # attempts
+BLOCK_DURATION_SECONDS = 60 * 5   # 5 minutes
 
+class LoginPayload(BaseModel):
+    username: str
+    password: str
 
-def get_client_ip(request: Request) -> str:
-    """Extract client IP address from request."""
-    # Check for forwarded IP (when behind proxy/load balancer)
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    
-    # Check for real IP header
-    real_ip = request.headers.get("X-Real-IP")
-    if real_ip:
-        return real_ip
-    
-    # Fallback to direct client
-    if request.client:
-        return request.client.host
-    
-    return "unknown"
+def record_request(endpoint: str, method: str, status: int, duration: float):
+    HTTP_REQ_TOTAL.labels(method=method, endpoint=endpoint, status=str(status)).inc()
+    HTTP_REQ_LATENCY.labels(endpoint=endpoint).observe(duration)
 
+@app.get("/health")
+async def health():
+    start = time.time()
+    resp = {"status": "ok", "time": int(start)}
+    duration = time.time() - start
+    record_request("/health", "GET", 200, duration)
+    return resp
 
-@app.middleware("http")
-async def security_middleware(request: Request, call_next):
-    """
-    Security middleware that:
-    - Tracks requests per IP
-    - Detects attack patterns
-    - Blocks suspicious IPs
-    - Records metrics
-    """
-    start_time = time.time()
-    ip_address = get_client_ip(request)
-    
-    # Check if IP is blocked
-    if security_manager.check_ip_blocked(ip_address):
-        logger.warning("Blocked IP attempted access", ip=ip_address)
-        return JSONResponse(
-            status_code=status.HTTP_403_FORBIDDEN,
-            content={"error": "IP address is blocked due to suspicious activity"}
-        )
-    
-    # Record request for suspicious behavior detection
-    threat_event = security_manager.record_request(ip_address)
-    if threat_event:
-        logger.warning("Suspicious activity detected", ip=ip_address, threat=threat_event.threat_id)
-        threats_detected_total.labels(
-            threat_level=threat_event.threat_level.value,
-            attack_type=threat_event.attack_type.value
-        ).inc()
-        active_threats.inc()
-    
-    # Detect attack patterns in request
-    query_string = str(request.query_params)
-    body = None
-    if request.method in ["POST", "PUT", "PATCH"]:
-        try:
-            body = await request.body()
-            body_str = body.decode('utf-8', errors='ignore')
-        except:
-            body_str = None
-    else:
-        body_str = None
-    
-    pattern_threat = security_manager.detect_attack_pattern(
-        request.url.path,
-        query_string,
-        body_str
-    )
-    
-    if pattern_threat:
-        pattern_threat.ip_address = ip_address
-        logger.warning("Attack pattern detected", ip=ip_address, attack_type=pattern_threat.attack_type.value)
-        threats_detected_total.labels(
-            threat_level=pattern_threat.threat_level.value,
-            attack_type=pattern_threat.attack_type.value
-        ).inc()
-        active_threats.inc()
-    
-    # Process request
-    response = await call_next(request)
-    
-    # Record metrics
-    duration = time.time() - start_time
-    http_requests_total.labels(
-        method=request.method,
-        endpoint=request.url.path,
-        status=response.status_code
-    ).inc()
-    
-    http_request_duration_seconds.labels(
-        method=request.method,
-        endpoint=request.url.path
-    ).observe(duration)
-    
-    return response
+@app.post("/login")
+async def login(payload: LoginPayload, request: Request):
+    start = time.time()
+    client_ip = request.client.host if request.client else "unknown"
 
+    # check blocked IP
+    unblock_time = BLOCKED_IPS.get(client_ip)
+    now = time.time()
+    if unblock_time and now < unblock_time:
+        FAILED_LOGINS.inc()
+        SUSPICIOUS_IPS.inc()
+        record_request("/login", "POST", 403, time.time()-start)
+        raise HTTPException(status_code=403, detail="IP temporarily blocked")
 
-@app.get("/", tags=["Root"])
-async def root():
-    """
-    Root endpoint - Welcome message.
-    """
-    return {
-        "message": "Welcome to Cyber-Twins: Self-Healing Cloud Infrastructure",
-        "version": settings.app_version,
-        "endpoints": {
-            "health": "/health",
-            "login": "/login",
-            "metrics": "/metrics",
-            "docs": "/docs"
-        }
-    }
+    # Dummy auth check (replace with real lookup)
+    correct_password = "changeme"
+    if payload.password != correct_password:
+        FAILED_LOGINS.inc()
+        FAILED_ATTEMPTS.setdefault(client_ip, []).append(now)
 
+        # prune attempts older than window
+        window = 60 * 10
+        FAILED_ATTEMPTS[client_ip] = [t for t in FAILED_ATTEMPTS[client_ip] if now - t < window]
 
-@app.get("/health", response_model=HealthResponse, tags=["Health"])
-async def health_check():
-    """
-    Health check endpoint.
-    Returns system health status and uptime.
-    """
-    uptime = get_uptime_seconds()
-    
-    return HealthResponse(
-        status="healthy",
-        version=settings.app_version,
-        timestamp=datetime.utcnow(),
-        uptime_seconds=uptime
-    )
+        if len(FAILED_ATTEMPTS[client_ip]) >= LOGIN_THRESHOLD:
+            BLOCKED_IPS[client_ip] = now + BLOCK_DURATION_SECONDS
+            REMEDIATIONS.inc()
+            SUSPICIOUS_IPS.inc()
 
+        record_request("/login", "POST", 401, time.time()-start)
+        raise HTTPException(status_code=401, detail="Invalid credentials")
 
-@app.post("/login", response_model=LoginResponse, tags=["Authentication"])
-async def login(login_request: LoginRequest, request: Request):
-    """
-    Login endpoint with security tracking.
-    
-    This endpoint:
-    - Validates credentials (demo: accepts 'admin'/'password123')
-    - Tracks failed login attempts
-    - Blocks IPs after threshold
-    - Records security metrics
-    """
-    ip_address = get_client_ip(request)
-    
-    # Demo authentication (in production, use proper auth)
-    valid_username = "admin"
-    valid_password = "password123"
-    
-    if login_request.username == valid_username and login_request.password == valid_password:
-        # Successful login
-        security_manager.record_successful_login(ip_address)
-        successful_logins_total.inc()
-        
-        logger.info("Successful login", username=login_request.username, ip=ip_address)
-        
-        # In production, generate JWT token here
-        return LoginResponse(
-            access_token="demo-token-12345",  # Replace with real JWT
-            token_type="bearer",
-            success=True,
-            message="Login successful"
-        )
-    else:
-        # Failed login
-        should_block, threat_event = security_manager.record_failed_login(
-            ip_address,
-            login_request.username
-        )
-        
-        failed_logins_total.labels(ip_address=ip_address).inc()
-        
-        if should_block and threat_event:
-            logger.warning("IP blocked due to failed logins", ip=ip_address, threat_id=threat_event.threat_id)
-            blocked_ips_current.inc()
-            threats_detected_total.labels(
-                threat_level=threat_event.threat_level.value,
-                attack_type=threat_event.attack_type.value
-            ).inc()
-            
-            # Trigger remediation (in production, this would call remediation service)
-            remediation_actions_total.labels(
-                action_type="ip_block",
-                status="triggered"
-            ).inc()
-        
-        logger.warning("Failed login attempt", username=login_request.username, ip=ip_address)
-        
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid username or password"
-        )
+    # success - reset attempts
+    FAILED_ATTEMPTS.pop(client_ip, None)
+    record_request("/login", "POST", 200, time.time()-start)
+    return {"detail": "login successful"}
 
-
-@app.get("/metrics", tags=["Monitoring"])
+@app.get("/metrics")
 async def metrics():
-    """
-    Custom metrics endpoint (in addition to Prometheus /metrics).
-    Returns summary of security metrics.
-    """
-    uptime = get_uptime_seconds()
-    blocked_ips = security_manager.get_blocked_ips()
-    recent_threats = security_manager.get_recent_threats(limit=10)
-    
-    return MetricsResponse(
-        total_requests=0,  # Would be calculated from Prometheus
-        failed_logins=sum(len(attempts) for attempts in security_manager.failed_logins.values()),
-        blocked_ips=len(blocked_ips),
-        active_threats=len([t for t in recent_threats if not t.remediated]),
-        remediation_actions=0,  # Would be calculated from Prometheus
-        uptime_seconds=uptime
-    )
+    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+
+    data = generate_latest()
+    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
 
-@app.get("/security/stats", tags=["Security"])
-async def security_stats():
-    """
-    Get security statistics.
-    Shows IP stats, blocked IPs, and recent threats.
-    """
-    blocked_ips = security_manager.get_blocked_ips()
-    recent_threats = security_manager.get_recent_threats(limit=50)
-    
-    return {
-        "blocked_ips": blocked_ips,
-        "blocked_count": len(blocked_ips),
-        "total_tracked_ips": len(security_manager.ip_stats),
-        "recent_threats": [
-            {
-                "threat_id": t.threat_id,
-                "ip_address": t.ip_address,
-                "threat_level": t.threat_level.value,
-                "attack_type": t.attack_type.value,
-                "timestamp": t.timestamp.isoformat(),
-                "description": t.description,
-                "remediated": t.remediated
-            }
-            for t in recent_threats
-        ],
-        "threat_count": len(recent_threats)
-    }
-
-
-@app.get("/security/ip/{ip_address}", tags=["Security"])
-async def get_ip_info(ip_address: str):
-    """
-    Get information about a specific IP address.
-    """
-    ip_stats = security_manager.get_ip_stats(ip_address)
-    
-    if not ip_stats:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No data found for IP: {ip_address}"
-        )
-    
-    return {
-        "ip_address": ip_stats.ip_address,
-        "failed_logins": ip_stats.failed_logins,
-        "total_requests": ip_stats.total_requests,
-        "suspicious_score": ip_stats.suspicious_score,
-        "is_blocked": ip_stats.is_blocked,
-        "first_seen": ip_stats.first_seen.isoformat(),
-        "last_seen": ip_stats.last_seen.isoformat(),
-        "block_until": ip_stats.block_until.isoformat() if ip_stats.block_until else None
-    }
-
-
+# If you want to run via python -m app.main
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        "app.main:app",
-        host=settings.host,
-        port=settings.port,
-        reload=settings.debug
-    )
-
-
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)

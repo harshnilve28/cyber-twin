@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cyber-twins
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cyber-twins
+  template:
+    metadata:
+      labels:
+        app: cyber-twins
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: cyber-twins
+        image: cyber-twins:latest
+        ports:
+        - containerPort: 8000
+        envFrom:
+        - secretRef:
+            name: cyber-twins-secrets   # create this or use configMap
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cyber-twins-service
+spec:
+  type: ClusterIP
+  selector:
+    app: cyber-twins
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
