@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: cyber-twins-service
+  labels:
+    app: cyber-twins
+spec:
+  type: ClusterIP  # Use LoadBalancer for cloud, NodePort for Minikube
+  ports:
+  - port: 80
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  selector:
+    app: cyber-twins
+---
+# For Minikube, also create a NodePort service
+apiVersion: v1
+kind: Service
+metadata:
+  name: cyber-twins-nodeport
+  labels:
+    app: cyber-twins
+spec:
+  type: NodePort
+  ports:
+  - port: 80
+    targetPort: 8000
+    nodePort: 30080
+    protocol: TCP
+    name: http
+  selector:
+    app: cyber-twins
+
+
